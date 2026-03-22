@@ -108,7 +108,7 @@ def run_netconvert(
             stderr=f"Command timed out after {timeout} seconds",
             returncode=-1,
         )
-    except Exception as e:
+    except (OSError, subprocess.SubprocessError) as e:
         logger.error(f"Failed to run netconvert: {e}")
         return NetconvertResult(
             success=False,
@@ -124,6 +124,7 @@ def extract_traffic_signs(
     output_file: Path,
     *,
     verbose: bool = False,
+    projection: str | None = None,
 ) -> NetconvertResult:
     """Extract traffic signs from OSM file to XML.
 
@@ -133,6 +134,7 @@ def extract_traffic_signs(
         osm_file: Input OSM file.
         output_file: Output XML file for traffic signs.
         verbose: Enable verbose output.
+        projection: Optional projection string for netconvert.
 
     Returns:
         NetconvertResult with command output and status.
@@ -146,10 +148,17 @@ def extract_traffic_signs(
         str(osm_file),
         "--street-sign-output",
         str(output_file),
-        "--proj.utm",
         "--output-file",
         "/dev/null",
     ]
+
+    # Projection
+    if projection:
+        args.extend(["--proj", projection])
+        args.append("--offset.disable-normalization=true")
+    else:
+        args.append("--proj.utm")
+        args.append("--offset.disable-normalization=false")
 
     if verbose:
         args.append("--verbose")
@@ -185,6 +194,7 @@ def generate_opendrive(
     # Logging
     verbose: bool = False,
     aggregate_warnings: int = 5,
+    projection: str | None = None,
 ) -> NetconvertResult:
     """Generate OpenDRIVE file from OSM with traffic signs.
 
@@ -232,54 +242,64 @@ def generate_opendrive(
         f"--opendrive-output.shape-match-dist={shape_match_dist}",
         "--output.street-names=true",
         "--output.original-names=true",
-        # Projection
-        "--proj.utm",
-        "--offset.disable-normalization=false",
-        f"--aggregate-warnings={aggregate_warnings}",
-        # Geometry
-        f"--geometry.remove={'true' if remove_geometry else 'false'}",
-        "--geometry.max-grade.fix=true",
-        "--geometry.min-dist=0.5",
-        # Junctions
-        f"--roundabouts.guess={'true' if guess_roundabouts else 'false'}",
-        f"--ramps.guess={'true' if guess_ramps else 'false'}",
-        "--edges.join=true",
-        "--junctions.join=false",
-        f"--junctions.join-dist={junction_join_dist}",
-        "--junctions.join-same=10",
-        f"--junctions.corner-detail={junction_corner_detail}",
-        f"--junctions.scurve-stretch={junction_scurve_stretch}",
-        "--rectangular-lane-cut=true",
-        f"--no-turnarounds={'true' if no_turnarounds else 'false'}",
-        # OSM import settings
-        "--osm.all-attributes=true",
-        "--osm.layer-elevation=4",
-        "--osm.layer-elevation.max-grade=5",
-        f"--osm.turn-lanes={'true' if import_turn_lanes else 'false'}",
-        "--osm.lane-access=true",
-        f"--osm.sidewalks={'true' if import_sidewalks else 'false'}",
-        f"--osm.bike-access={'true' if import_bike_access else 'false'}",
-        f"--osm.crossings={'true' if import_crossings else 'false'}",
-        # Traffic lights
-        f"--tls.guess-signals={'true' if guess_tls_signals else 'false'}",
-        "--tls.discard-simple=true",
-        "--tls.join=true",
-        "--tls.group-signals=true",
-        "--tls.default-type=actuated",
-        # Pedestrians & bicycles (don't guess, use OSM data)
-        "--crossings.guess=false",
-        "--sidewalks.guess=false",
-        "--sidewalks.guess.from-permissions=false",
-        "--bikelanes.guess=false",
-        "--bikelanes.guess.from-permissions=false",
-        # Defaults
-        f"--default.lanewidth={lane_width}",
-        f"--default.sidewalk-width={sidewalk_width}",
-        f"--default.bikelane-width={bikelane_width}",
-        f"--default.crossing-width={crossing_width}",
-        # Cleanup
-        "--remove-edges.isolated=true",
     ]
+
+    # Projection
+    if projection:
+        args.extend(["--proj", projection])
+        args.append("--offset.disable-normalization=true")
+    else:
+        args.append("--proj.utm")
+        args.append("--offset.disable-normalization=false")
+
+    args.extend(
+        [
+            f"--aggregate-warnings={aggregate_warnings}",
+            # Geometry
+            f"--geometry.remove={'true' if remove_geometry else 'false'}",
+            "--geometry.max-grade.fix=true",
+            "--geometry.min-dist=0.5",
+            # Junctions
+            f"--roundabouts.guess={'true' if guess_roundabouts else 'false'}",
+            f"--ramps.guess={'true' if guess_ramps else 'false'}",
+            "--edges.join=true",
+            "--junctions.join=false",
+            f"--junctions.join-dist={junction_join_dist}",
+            "--junctions.join-same=10",
+            f"--junctions.corner-detail={junction_corner_detail}",
+            f"--junctions.scurve-stretch={junction_scurve_stretch}",
+            "--rectangular-lane-cut=true",
+            f"--no-turnarounds={'true' if no_turnarounds else 'false'}",
+            # OSM import settings
+            "--osm.all-attributes=true",
+            "--osm.layer-elevation=4",
+            "--osm.layer-elevation.max-grade=5",
+            f"--osm.turn-lanes={'true' if import_turn_lanes else 'false'}",
+            "--osm.lane-access=true",
+            f"--osm.sidewalks={'true' if import_sidewalks else 'false'}",
+            f"--osm.bike-access={'true' if import_bike_access else 'false'}",
+            f"--osm.crossings={'true' if import_crossings else 'false'}",
+            # Traffic lights
+            f"--tls.guess-signals={'true' if guess_tls_signals else 'false'}",
+            "--tls.discard-simple=true",
+            "--tls.join=true",
+            "--tls.group-signals=true",
+            "--tls.default-type=actuated",
+            # Pedestrians & bicycles (don't guess, use OSM data)
+            "--crossings.guess=false",
+            "--sidewalks.guess=false",
+            "--sidewalks.guess.from-permissions=false",
+            "--bikelanes.guess=false",
+            "--bikelanes.guess.from-permissions=false",
+            # Defaults
+            f"--default.lanewidth={lane_width}",
+            f"--default.sidewalk-width={sidewalk_width}",
+            f"--default.bikelane-width={bikelane_width}",
+            f"--default.crossing-width={crossing_width}",
+            # Cleanup
+            "--remove-edges.isolated=true",
+        ]
+    )
 
     # Add polygon files if signs were extracted
     if signs_file and signs_file.exists():

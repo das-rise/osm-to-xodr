@@ -106,6 +106,10 @@ def convert(
         int,
         typer.Option("--junction-corner-detail", help="Number of points for smoothing corners."),
     ] = 5,
+    junction_join_dist: Annotated[
+        float,
+        typer.Option("--junction-join-dist", help="Distance threshold for joining junctions."),
+    ] = 2.0,
     # Feature flags
     no_roundabouts: Annotated[
         bool,
@@ -135,6 +139,10 @@ def convert(
         bool,
         typer.Option("--no-bike-access", help="Don't import bike lane access from OSM."),
     ] = False,
+    import_netconvert_signs: Annotated[
+        bool,
+        typer.Option("--import-netconvert-signs", help="Import signs inferred by netconvert."),
+    ] = False,
     keep_geometry: Annotated[
         bool,
         typer.Option("--keep-geometry", help="Don't simplify geometry."),
@@ -152,6 +160,13 @@ def convert(
         bool,
         typer.Option("--verbose", "-v", help="Enable verbose output."),
     ] = False,
+    # Signal options
+    country: Annotated[
+        str,
+        typer.Option(
+            "--country", "-c", help="Country code for traffic signal mapping (e.g., SE, DE)."
+        ),
+    ] = "SE",
     _version: Annotated[
         bool | None,
         typer.Option("--version", "-V", callback=version_callback, is_eager=True),
@@ -179,6 +194,7 @@ def convert(
         bikelane_width=bikelane_width,
         crossing_width=crossing_width,
         junction_corner_detail=junction_corner_detail,
+        junction_join_dist=junction_join_dist,
         guess_roundabouts=not no_roundabouts,
         guess_ramps=not no_ramps,
         guess_tls_signals=not no_tls,
@@ -186,8 +202,10 @@ def convert(
         import_crossings=not no_crossings,
         import_turn_lanes=not no_turn_lanes,
         import_bike_access=not no_bike_access,
+        import_netconvert_signs=import_netconvert_signs,
         remove_geometry=not keep_geometry,
         no_turnarounds=not turnarounds,
+        country=country,
     )
 
     app_settings = AppSettings(

@@ -8,31 +8,66 @@ Also handles geoReference fixup for CARLA compatibility.
 
 from __future__ import annotations
 
+import math
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 import utm
 from loguru import logger
 
-# CARLA / OpenDRIVE Standard Mapping (German StVO codes)
-# These are commonly used traffic sign type IDs
-TYPE_MAPPING: dict[str, str] = {
-    "priority": "306",  # Priority road (Diamond sign)
-    "yield": "205",  # Yield / Give Way
-    "stop": "206",  # Stop
-    "right before left": "102",  # Danger: Crossroad
-    "speedLimit": "274",  # Speed Limit
+try:
+    import pyproj as _pyproj
+except ImportError:
+    _pyproj = None  # type: ignore[assignment]
+
+# Country-specific Signal Mappings
+# SE: Swedish Vägmärken, DE: German StVO (industry standard for CARLA/OpenDRIVE)
+COUNTRY_MAPPINGS: dict[str, dict[str, str]] = {
+    "SE": {
+        "priority": "401",  # Priority road (Huvudled)
+        "yield": "206",  # Yield / Give Way (Väjningsplikt)
+        "stop": "201",  # Stop
+        "right before left": "102",  # Danger: Crossroad
+        "speedLimit": "274",  # Speed Limit
+        "speed": "274",  # Generic speed limit
+        "traffic_light": "1000001",  # Traffic signals (International)
+        "no_entry": "267",  # No entry (Industry standard)
+    },
+    "DE": {
+        "priority": "306",  # Priority road (Diamond sign)
+        "yield": "205",  # Yield / Give Way
+        "stop": "206",  # Stop
+        "right before left": "102",  # Danger: Crossroad
+        "speedLimit": "274",  # Speed Limit
+        "speed": "274",  # Generic speed limit
+        "traffic_light": "1000001",
+        "no_entry": "267",
+    },
 }
 
 # Default dimensions for different sign types (width, height) in meters
-DIMENSIONS: dict[str, tuple[str, str]] = {
-    "306": ("0.6", "0.6"),  # Priority road
-    "205": ("0.9", "0.8"),  # Yield
-    "206": ("0.75", "0.75"),  # Stop
-    "102": ("0.7", "0.7"),  # Danger: Crossroad
-    "274": ("0.6", "0.6"),  # Speed Limit
+COUNTRY_DIMENSIONS: dict[str, dict[str, tuple[str, str]]] = {
+    "SE": {
+        "401": ("0.6", "0.6"),
+        "206": ("0.9", "0.8"),
+        "201": ("0.75", "0.75"),
+        "102": ("0.7", "0.7"),
+        "274": ("0.6", "0.6"),
+        "1000001": ("0.3", "0.7"),  # Traffic light box
+        "267": ("0.6", "0.6"),
+    },
+    "DE": {
+        "306": ("0.6", "0.6"),
+        "205": ("0.9", "0.8"),
+        "206": ("0.75", "0.75"),
+        "102": ("0.7", "0.7"),
+        "274": ("0.6", "0.6"),
+        "1000001": ("0.3", "0.7"),
+        "267": ("0.6", "0.6"),
+    },
 }
 
 
@@ -170,15 +205,421 @@ def _add_pole(objects_elem: ET.Element, source_obj: ET.Element) -> None:
     pole.set("roll", "0.0")
 
 
+def _get_mapping_key_from_poi(poi: ET.Element) -> str | None:
+    """Resolve a POI to an internal mapping key used by COUNTRY_MAPPINGS."""
+    poi_type = poi.get("type", "")
+    if poi_type:
+        return poi_type
+
+    params = {param.get("key", ""): param.get("value", "") for param in poi.findall("param")}
+    if params.get("osm.highway") == "give_way":
+        return "yield"
+    if params.get("osm.highway") == "stop":
+        return "stop"
+    if params.get("osm.highway") == "traffic_signals":
+        return "traffic_light"
+    return params.get("osm.traffic_sign")
+
+
+def _get_sign_heading_offset_deg(params: dict[str, str]) -> float:
+    """Return a sign heading offset, in degrees, from OSM params.
+
+    Supports:
+    - direction (standard OSM tag)
+    - traffic_sign:direction (standard OSM tag)
+    - forward/backward values for direction
+    """
+    # Check for standard OSM direction tags
+    direction = params.get("osm.direction") or params.get("osm.traffic_sign:direction")
+    if direction is not None:
+        direction = str(direction).strip().lower()
+
+        # Handle relative direction (standard in OSM for signs on ways).
+        # Note: forward/backward are encoded in the signal's orientation attribute
+        # (+/-), so no additional hOffset is needed here.
+        if direction in ("forward", "backward"):
+            return 0.0
+
+        # Handle numeric direction
+        try:
+            return float(direction)
+        except (TypeError, ValueError):
+            pass
+
+    return 0.0
+
+
+def _load_poi_params_by_id(poi_file: Path | None) -> dict[str, dict[str, str]]:
+    """Load POI param key/value pairs keyed by POI id."""
+    if poi_file is None or not poi_file.exists():
+        return {}
+
+    try:
+        poi_root = ET.parse(poi_file).getroot()
+    except ET.ParseError:
+        return {}
+
+    params_by_id: dict[str, dict[str, str]] = {}
+    for poi in poi_root.findall("poi"):
+        poi_id = poi.get("id")
+        if not poi_id:
+            continue
+        params_by_id[poi_id] = {
+            param.get("key", ""): param.get("value", "") for param in poi.findall("param")
+        }
+    return params_by_id
+
+
+def _project_point_to_segment(
+    px: float,
+    py: float,
+    start: tuple[float, float, float],
+    end: tuple[float, float, float],
+) -> tuple[float, float, float]:
+    """Project a point onto a planView segment.
+
+    Returns:
+        Tuple of (distance_to_segment, s_value, signed_t_value).
+    """
+    x0, y0, s0 = start
+    x1, y1, s1 = end
+    vx = x1 - x0
+    vy = y1 - y0
+    segment_length_sq = vx * vx + vy * vy
+    if segment_length_sq == 0:
+        distance = math.hypot(px - x0, py - y0)
+        return distance, s0, 0.0
+
+    projection_ratio = ((px - x0) * vx + (py - y0) * vy) / segment_length_sq
+    projection_ratio = max(0.0, min(1.0, projection_ratio))
+
+    projected_x = x0 + projection_ratio * vx
+    projected_y = y0 + projection_ratio * vy
+    dx = px - projected_x
+    dy = py - projected_y
+    distance = math.hypot(dx, dy)
+
+    cross = vx * (py - y0) - vy * (px - x0)
+    signed_t = distance if cross > 0 else -distance
+    s_value = s0 + projection_ratio * max(s1 - s0, math.hypot(vx, vy))
+    return distance, s_value, signed_t
+
+
+def _build_road_reference_points(
+    root: ET.Element,
+) -> list[tuple[ET.Element, list[tuple[float, float, float]]]]:
+    """Build road polyline reference points from planView geometry starts."""
+    roads: list[tuple[ET.Element, list[tuple[float, float, float]]]] = []
+
+    for road in root.findall("road"):
+        plan_view = road.find("planView")
+        if plan_view is None:
+            continue
+
+        points: list[tuple[float, float, float]] = []
+        last_geom: ET.Element | None = None
+        for geometry in plan_view.findall("geometry"):
+            try:
+                points.append(
+                    (
+                        float(geometry.get("x", "0")),
+                        float(geometry.get("y", "0")),
+                        float(geometry.get("s", "0")),
+                    )
+                )
+                last_geom = geometry
+            except ValueError:
+                continue
+
+        # Append the actual road endpoint computed from the last geometry's
+        # heading and length.  Also extend another 20 m beyond that so signs
+        # that fall inside a junction box (which netconvert trims the road
+        # back into) can still be projected onto the correct road with a
+        # realistic lateral offset.  The caller should clamp s to road length.
+        if last_geom is not None and points:
+            try:
+                lx, ly, ls = points[-1]
+                l_hdg = float(last_geom.get("hdg", "0"))
+                l_len = float(last_geom.get("length", "0"))
+                end_x = lx + l_len * math.cos(l_hdg)
+                end_y = ly + l_len * math.sin(l_hdg)
+                end_s = ls + l_len
+                points.append((end_x, end_y, end_s))
+                _JUNCTION_EXTENSION_M = 20.0
+                points.append(
+                    (
+                        end_x + _JUNCTION_EXTENSION_M * math.cos(l_hdg),
+                        end_y + _JUNCTION_EXTENSION_M * math.sin(l_hdg),
+                        end_s + _JUNCTION_EXTENSION_M,
+                    )
+                )
+            except ValueError:
+                pass
+
+        if len(points) >= 2:
+            roads.append((road, points))
+
+    return roads
+
+
+def _get_utm_zone_number(root: ET.Element) -> int | None:
+    """Extract the UTM zone number from the OpenDRIVE geoReference."""
+    header = root.find("header")
+    georef = header.find("geoReference") if header is not None else None
+    georef_text = georef.text if georef is not None else ""
+    if not georef_text:
+        return None
+
+    zone_match = re.search(r"\+zone=(\d+)", georef_text)
+    if zone_match is None:
+        return None
+
+    return int(zone_match.group(1))
+
+
+def _get_georef_proj_string(root: ET.Element) -> str | None:
+    """Extract the raw projection string from the OpenDRIVE geoReference."""
+    header = root.find("header")
+    georef = header.find("geoReference") if header is not None else None
+    if georef is None:
+        return None
+    text = (georef.text or "").strip()
+    return text if text else None
+
+
+def _make_latlon_to_local(
+    root: ET.Element, offset_x: float, offset_y: float
+) -> Callable[[float, float], tuple[float, float]] | None:
+    """Build a callable that converts (lat, lon) → (local_x, local_y).
+
+    Handles both ``+proj=utm`` and ``+proj=tmerc`` geoReferences.
+    Falls back to UTM auto-zone when the zone cannot be determined.
+    Returns *None* only if neither UTM nor pyproj can be used.
+    """
+    proj_str = _get_georef_proj_string(root)
+
+    # tmerc projection (e.g. viewer-supplied +proj=tmerc +lat_0=... +lon_0=...)
+    if proj_str and "+proj=tmerc" in proj_str and _pyproj is not None:
+        try:
+            proj = _pyproj.Proj(proj_str)
+
+            def _tmerc(
+                lat: float, lon: float, _proj=proj, _ox=offset_x, _oy=offset_y
+            ) -> tuple[float, float]:
+                x, y = _proj(lon, lat)  # pyproj takes (lon, lat) order
+                return x - _ox, y - _oy
+
+            return _tmerc
+        except Exception as exc:
+            logger.warning(f"Failed to build tmerc projector from '{proj_str}': {exc}")
+
+    # Default: UTM (may auto-detect zone from lat/lon if zone_number is None)
+    zone_number = _get_utm_zone_number(root)
+
+    def _utm_convert(
+        lat: float, lon: float, _zone=zone_number, _ox=offset_x, _oy=offset_y
+    ) -> tuple[float, float]:
+        easting, northing, _, _ = utm.from_latlon(float(lat), float(lon), force_zone_number=_zone)
+        return easting - _ox, northing - _oy
+
+    return _utm_convert
+
+
+def _get_road_sumo_way_id(road: ET.Element) -> str | None:
+    """Extract the source OSM way id from a road's SUMO userData, if present."""
+    user_data = road.find("userData[@code='sumoId']")
+    if user_data is None:
+        return None
+
+    sumo_id = user_data.get("value")
+    if not sumo_id:
+        return None
+
+    return sumo_id.split("#", 1)[0]
+
+
+def _load_osm_sign_parent_ways(osm_file: Path | None) -> dict[str, set[str]]:
+    """Map OSM sign node ids to the source way ids that contain them."""
+    if osm_file is None or not osm_file.exists():
+        return {}
+
+    root = ET.parse(osm_file).getroot()
+    give_way_nodes = {
+        node.get("id")
+        for node in root.findall("node")
+        if any(
+            tag.get("k") == "highway" and tag.get("v") == "give_way" for tag in node.findall("tag")
+        )
+    }
+
+    parent_ways: dict[str, set[str]] = {node_id: set() for node_id in give_way_nodes if node_id}
+    for way in root.findall("way"):
+        way_id = way.get("id")
+        if not way_id:
+            continue
+        for node_ref in (nd.get("ref") for nd in way.findall("nd")):
+            if node_ref in parent_ways:
+                parent_ways[node_ref].add(way_id)
+
+    return parent_ways
+
+
+def _add_missing_poi_signals(
+    root: ET.Element,
+    poi_file: Path,
+    country: str,
+    osm_file: Path | None = None,
+) -> tuple[int, int]:
+    """Add signals for POIs that netconvert did not materialize as objects.
+
+    This is a fallback path for signs near complex junctions and roundabouts,
+    where SUMO may drop the polygon POI instead of turning it into a road object.
+    """
+    poi_tree = ET.parse(poi_file)
+    poi_root = poi_tree.getroot()
+
+    existing_signal_ids = {
+        signal.get("id") for signal in root.findall(".//signal") if signal.get("id")
+    }
+
+    header = root.find("header")
+    offset = header.find("offset") if header is not None else None
+    offset_x = float(offset.get("x", "0")) if offset is not None else 0.0
+    offset_y = float(offset.get("y", "0")) if offset is not None else 0.0
+    latlon_to_local = _make_latlon_to_local(root, offset_x, offset_y)
+    parent_ways = _load_osm_sign_parent_ways(osm_file)
+
+    roads = _build_road_reference_points(root)
+    mapping = COUNTRY_MAPPINGS.get(country.upper(), COUNTRY_MAPPINGS["SE"])
+    dimensions = COUNTRY_DIMENSIONS.get(country.upper(), COUNTRY_DIMENSIONS["SE"])
+
+    added_signals = 0
+    added_poles = 0
+
+    for poi in poi_root.findall("poi"):
+        poi_id = poi.get("id")
+        if not poi_id or poi_id in existing_signal_ids:
+            continue
+
+        mapping_key = _get_mapping_key_from_poi(poi)
+        if not mapping_key or mapping_key not in mapping:
+            continue
+
+        params = {param.get("key", ""): param.get("value", "") for param in poi.findall("param")}
+
+        lat = poi.get("lat")
+        lon = poi.get("lon")
+        if not lat or not lon:
+            continue
+
+        local_x, local_y = latlon_to_local(float(lat), float(lon))
+
+        best_distance = float("inf")
+        best_road: ET.Element | None = None
+        best_s = 0.0
+        best_t = 0.0
+
+        preferred_way_ids = parent_ways.get(poi_id, set())
+        candidate_roads = roads
+        if preferred_way_ids:
+            preferred_roads = [
+                (road, points)
+                for road, points in roads
+                if _get_road_sumo_way_id(road) in preferred_way_ids
+            ]
+            if preferred_roads:
+                candidate_roads = preferred_roads
+
+        for road, points in candidate_roads:
+            for start, end in zip(points, points[1:]):
+                distance, s_value, t_value = _project_point_to_segment(
+                    local_x,
+                    local_y,
+                    start,
+                    end,
+                )
+                if distance < best_distance:
+                    best_distance = distance
+                    best_road = road
+                    best_s = s_value
+                    best_t = t_value
+
+        if best_road is None or best_distance > 25.0:
+            continue
+
+        # Clamp s to road length: the virtual extension may produce s values
+        # beyond the road end, which would be invalid in OpenDRIVE.
+        road_length = float(best_road.get("length", str(best_s)))
+        best_s = min(best_s, road_length)
+
+        signals_elem = best_road.find("signals")
+        if signals_elem is None:
+            signals_elem = ET.SubElement(best_road, "signals")
+
+        objects_elem = best_road.find("objects")
+        if objects_elem is None:
+            objects_elem = ET.SubElement(best_road, "objects")
+
+        signal_type_id = mapping[mapping_key]
+        width, height = dimensions.get(signal_type_id, ("0.5", "0.5"))
+
+        signal = ET.SubElement(signals_elem, "signal")
+        signal.set("id", poi_id)
+        signal.set("type", signal_type_id)
+        signal.set("name", mapping_key)
+        signal.set("s", f"{best_s:.8f}")
+        signal.set("t", f"{best_t:.8f}")
+        signal.set("dynamic", "no")
+        signal.set("zOffset", "2.0")
+        signal.set("country", country.upper())
+        signal.set("width", width)
+        signal.set("height", height)
+        signal.set("hOffset", f"{math.radians(_get_sign_heading_offset_deg(params)):.8f}")
+        signal.set("pitch", "0.0")
+        signal.set("roll", "0.0")
+        signal.set("orientation", "+" if best_t < 0 else "-")
+
+        pole = ET.SubElement(objects_elem, "object")
+        pole.set("id", poi_id + ".pole")
+        pole.set("type", "pole")
+        pole.set("name", "Sign Pole")
+        pole.set("s", f"{best_s:.8f}")
+        pole.set("t", f"{best_t:.8f}")
+        pole.set("zOffset", "0.0")
+        pole.set("height", "2.0")
+        pole.set("radius", "0.05")
+        pole.set("dynamic", "no")
+        pole.set("hdg", "0.0")
+        pole.set("pitch", "0.0")
+        pole.set("roll", "0.0")
+
+        existing_signal_ids.add(poi_id)
+        added_signals += 1
+        added_poles += 1
+
+    return added_signals, added_poles
+
+
 def _process_signals(
     objects_elem: ET.Element,
     signals_elem: ET.Element,
+    country: str = "SE",
+    poi_params_by_id: dict[str, dict[str, str]] | None = None,
+    parent_ways: dict[str, set[str]] | None = None,
+    road_way_id: str | None = None,
 ) -> tuple[int, int]:
     """Convert traffic sign objects to OpenDRIVE signals.
 
     Args:
         objects_elem: Objects element containing sign objects.
         signals_elem: Signals element to add converted signals to.
+        country: Country code for signal mapping.
+        poi_params_by_id: Additional POI metadata keyed by id.
+        parent_ways: Mapping of OSM node id to the set of parent way ids.
+            When provided together with *road_way_id*, objects whose node id
+            maps to a *different* way are skipped so that
+            ``_add_missing_poi_signals`` can place them on the correct road.
+        road_way_id: The source OSM way id of the current road (from SUMO userData).
 
     Returns:
         Tuple of (signals_converted, poles_added).
@@ -187,28 +628,69 @@ def _process_signals(
     converted_count = 0
     poles_count = 0
 
+    # Get country-specific mapping
+    mapping = COUNTRY_MAPPINGS.get(country.upper(), COUNTRY_MAPPINGS["SE"])
+    dimensions = COUNTRY_DIMENSIONS.get(country.upper(), COUNTRY_DIMENSIONS["SE"])
+
     for obj in objects_elem.findall("object"):
-        raw_type = obj.get("type")
+        # Extract parameters (OSM tags stored via osm_extractor.py)
+        params = {p.get("key", ""): p.get("value", "") for p in obj.findall("param")}
+        poi_params = (poi_params_by_id or {}).get(obj.get("id", ""), {})
+        if poi_params:
+            merged_params = dict(poi_params)
+            merged_params.update(params)
+            params = merged_params
 
-        if raw_type in TYPE_MAPPING:
-            signal_type_id = TYPE_MAPPING[raw_type]
+        # Skip objects that netconvert placed on the wrong road.
+        # If the object's OSM node id belongs to a known parent way and
+        # that way does not match this road, leave the object so that
+        # _add_missing_poi_signals can place it on the correct road.
+        if parent_ways and road_way_id is not None:
+            obj_id = obj.get("id", "")
+            expected_ways = parent_ways.get(obj_id)
+            if expected_ways and road_way_id not in expected_ways:
+                continue
 
+        # raw_type is usually the 'type' attribute from netconvert,
+        # but for custom objects it might be the 'id'.
+        raw_type = obj.get("id", "") if not obj.get("type") else obj.get("type", "")
+
+        # Override with specific OSM tag if present
+        osm_sign = params.get("osm.traffic_sign")
+        osm_highway = params.get("osm.highway")
+
+        # Use highway tag if we know it maps to a sign (e.g. give_way -> yield)
+        if not osm_sign and osm_highway in ("give_way", "stop", "priority"):
+            # Map OSM highway tags to generic internal types
+            highway_to_type = {"give_way": "yield", "stop": "stop", "priority": "priority"}
+            search_type = highway_to_type.get(osm_highway, raw_type)
+        else:
+            search_type = osm_sign if osm_sign else raw_type
+
+        signal_type_id = None
+        if search_type in mapping:
+            signal_type_id = mapping[search_type]
+        elif country and search_type.startswith(f"{country.upper()}:"):
+            # Direct country code (e.g. SE:B3)
+            signal_type_id = search_type
+
+        if signal_type_id:
             # Create Signal
             signal = ET.SubElement(signals_elem, "signal")
             signal.set("id", obj.get("id", ""))
             signal.set("type", signal_type_id)
-            signal.set("name", raw_type or "")
+            signal.set("name", search_type)
             signal.set("s", obj.get("s", "0.0"))
             signal.set("t", obj.get("t", "0.0"))
             signal.set("dynamic", "no")
             signal.set("zOffset", "2.0")
-            signal.set("country", "SE")  # Sweden
+            signal.set("country", country.upper())
 
-            w, h = DIMENSIONS.get(signal_type_id, ("0.5", "0.5"))
+            w, h = dimensions.get(signal_type_id, ("0.5", "0.5"))
             signal.set("width", w)
             signal.set("height", h)
 
-            signal.set("hOffset", "0.0")
+            signal.set("hOffset", f"{math.radians(_get_sign_heading_offset_deg(params)):.8f}")
             signal.set("pitch", "0.0")
             signal.set("roll", "0.0")
 
@@ -236,7 +718,13 @@ def _process_signals(
     return converted_count, poles_count
 
 
-def convert_objects_to_signals(xodr_file: Path) -> ConversionResult:
+def convert_objects_to_signals(
+    xodr_file: Path,
+    country: str = "SE",
+    poi_file: Path | None = None,
+    osm_file: Path | None = None,
+    keep_netconvert_signals: bool = False,
+) -> ConversionResult:
     """Convert traffic sign objects to OpenDRIVE signals in an XODR file.
 
     This function modifies the XODR file in place, converting objects
@@ -244,6 +732,10 @@ def convert_objects_to_signals(xodr_file: Path) -> ConversionResult:
 
     Args:
         xodr_file: Path to the OpenDRIVE file to process.
+        country: Country code for signal mapping.
+        poi_file: Path to the POI file for metadata lookup.
+        osm_file: Path to the original OSM file.
+        keep_netconvert_signals: Whether to keep existing signals in the XODR.
 
     Returns:
         ConversionResult with success status and counts.
@@ -271,17 +763,34 @@ def convert_objects_to_signals(xodr_file: Path) -> ConversionResult:
 
     total_signals = 0
     total_poles = 0
+    poi_params_by_id = _load_poi_params_by_id(poi_file)
+    parent_ways = _load_osm_sign_parent_ways(osm_file) if osm_file else None
 
     for road in root.findall("road"):
+        signals_elem = road.find("signals")
+        if signals_elem is not None:
+            if not keep_netconvert_signals:
+                # Remove all implicit signals generated by netconvert
+                # so we only keep the explicit ones from the OSM layer
+                for sig in list(signals_elem):
+                    signals_elem.remove(sig)
+        else:
+            signals_elem = ET.SubElement(road, "signals")
+
         objects_elem = road.find("objects")
         if objects_elem is None:
             continue
 
-        signals_elem = road.find("signals")
-        if signals_elem is None:
-            signals_elem = ET.SubElement(road, "signals")
+        road_way_id = _get_road_sumo_way_id(road)
 
-        signals, poles = _process_signals(objects_elem, signals_elem)
+        signals, poles = _process_signals(
+            objects_elem,
+            signals_elem,
+            country=country,
+            poi_params_by_id=poi_params_by_id,
+            parent_ways=parent_ways,
+            road_way_id=road_way_id,
+        )
         total_signals += signals
         total_poles += poles
 
@@ -289,19 +798,29 @@ def convert_objects_to_signals(xodr_file: Path) -> ConversionResult:
         if len(objects_elem) == 0:
             road.remove(objects_elem)
 
-    if total_signals > 0:
-        try:
-            tree.write(xodr_file, encoding="UTF-8", xml_declaration=True)
-            logger.info(f"Converted {total_signals} signals, added {total_poles} poles")
-        except Exception as e:
-            return ConversionResult(
-                success=False,
-                signals_converted=total_signals,
-                poles_added=total_poles,
-                error=f"Failed to write file: {e}",
-            )
-    else:
-        logger.info("No matching objects found to convert")
+    if poi_file is not None and poi_file.exists():
+        added_signals, added_poles = _add_missing_poi_signals(
+            root,
+            poi_file,
+            country,
+            osm_file=osm_file,
+        )
+        total_signals += added_signals
+        total_poles += added_poles
+
+    # Always write to save deletions of implicit netconvert signals
+    try:
+        tree.write(xodr_file, encoding="UTF-8", xml_declaration=True)
+        logger.info(
+            f"Processed signals: kept {total_signals} explicit signs, added {total_poles} poles"
+        )
+    except Exception as e:
+        return ConversionResult(
+            success=False,
+            signals_converted=total_signals,
+            poles_added=total_poles,
+            error=f"Failed to write file: {e}",
+        )
 
     return ConversionResult(
         success=True,

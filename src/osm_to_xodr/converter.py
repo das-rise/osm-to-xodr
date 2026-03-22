@@ -16,6 +16,7 @@ from osm_to_xodr.netconvert import (
     generate_opendrive,
     get_netconvert_version,
 )
+from osm_to_xodr.osm_extractor import OSMSignalExtractor, merge_poi_files
 from osm_to_xodr.postprocess import (
     convert_objects_to_signals,
     fix_georeference_for_carla,
@@ -41,6 +42,7 @@ def convert_osm_to_xodr(
     app_settings: AppSettings | None = None,
     verbose: bool | None = None,
     keep_intermediate: bool | None = None,
+    projection: str | None = None,
 ) -> ConversionResult:
     """Convert an OpenStreetMap file to OpenDRIVE format.
 
@@ -120,24 +122,46 @@ def convert_osm_to_xodr(
     try:
         # Step 1: Extract traffic signs
         logger.info("Step 1: Extracting traffic signs from OSM...")
-        result = extract_traffic_signs(
-            input_file,
-            signs_file,
-            verbose=app_settings.verbose,
-        )
 
-        if not result.success:
-            logger.warning(f"Sign extraction had issues: {result.stderr}")
-            # Continue anyway - signs are optional
+        # Always use custom OSMSignalExtractor (matches OSM exactly)
+        custom_signs_file = signs_file.with_suffix(".custom.xml")
+        extractor = OSMSignalExtractor(input_file)
+        extractor.extract(custom_signs_file)
 
-        actual_signs_file: Path | None = signs_file
-        if signs_file.exists():
-            logger.debug(f"Signs extracted to: {signs_file}")
+        # Use signs_file for netconvert output
+        actual_signs_file: Path | None = None
+
+        if netconvert_settings.import_netconvert_signs:
+            logger.info("Extracting additional signs using netconvert...")
+            # We skip netconvert's sign extraction because it generates many implicit yield/priority
+            # signs at junctions that do not exist as explicit nodes in OSM.
+            # But we allow it if the user wants it.
+            extract_traffic_signs(
+                input_file, signs_file, verbose=app_settings.verbose, projection=projection
+            )
+
+            # Merge results from both extractors if they both exist
+            if custom_signs_file.exists() and signs_file.exists():
+                logger.info(
+                    f"Merging custom signs ({custom_signs_file.name}) and netconvert signs ({signs_file.name})"
+                )
+                actual_signs_file = signs_file.with_suffix(".merged.xml")
+                merge_poi_files(custom_signs_file, signs_file, actual_signs_file)
+            elif custom_signs_file.exists():
+                actual_signs_file = custom_signs_file
+            elif signs_file.exists():
+                actual_signs_file = signs_file
         else:
-            logger.debug("No signs extracted (file not created)")
-            actual_signs_file = None
+            # Use only custom extracted signs to match OSM exactly
+            if custom_signs_file.exists():
+                logger.debug("Using signs from custom extractor")
+                actual_signs_file = custom_signs_file
+
+        if actual_signs_file is None:
+            logger.debug("No signs extracted")
 
         # Step 2: Generate OpenDRIVE
+
         logger.info("Step 2: Generating OpenDRIVE network...")
         result = generate_opendrive(
             input_file,
@@ -162,13 +186,14 @@ def convert_osm_to_xodr(
             no_turnarounds=netconvert_settings.no_turnarounds,
             verbose=app_settings.verbose,
             aggregate_warnings=netconvert_settings.aggregate_warnings,
+            projection=projection,
         )
 
         if not result.success:
             return ConversionResult(
                 success=False,
                 output_file=None,
-                signs_file=signs_file if app_settings.keep_intermediate else None,
+                signs_file=actual_signs_file if app_settings.keep_intermediate else None,
                 signals_converted=0,
                 error=f"OpenDRIVE generation failed: {result.stderr}",
             )
@@ -177,7 +202,7 @@ def convert_osm_to_xodr(
             return ConversionResult(
                 success=False,
                 output_file=None,
-                signs_file=signs_file if app_settings.keep_intermediate else None,
+                signs_file=actual_signs_file if app_settings.keep_intermediate else None,
                 signals_converted=0,
                 error="OpenDRIVE file was not created",
             )
@@ -186,7 +211,13 @@ def convert_osm_to_xodr(
 
         # Step 3: Post-process signals
         logger.info("Step 3: Post-processing (Objects -> Signals)...")
-        postprocess_result = convert_objects_to_signals(output_file)
+        postprocess_result = convert_objects_to_signals(
+            output_file,
+            country=netconvert_settings.country,
+            poi_file=actual_signs_file,
+            osm_file=input_file,
+            keep_netconvert_signals=netconvert_settings.import_netconvert_signs,
+        )
 
         if not postprocess_result.success:
             logger.warning(f"Post-processing failed: {postprocess_result.error}")
@@ -202,7 +233,7 @@ def convert_osm_to_xodr(
         return ConversionResult(
             success=True,
             output_file=output_file,
-            signs_file=signs_file if app_settings.keep_intermediate else None,
+            signs_file=actual_signs_file if app_settings.keep_intermediate else None,
             signals_converted=postprocess_result.signals_converted,
         )
 

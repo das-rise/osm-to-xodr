@@ -92,6 +92,13 @@ class NetconvertSettings(BaseSettings):
         bool,
         Field(default=True, description="Import bike lane access from OSM"),
     ]
+    import_netconvert_signs: Annotated[
+        bool,
+        Field(
+            default=False,
+            description="Import signs inferred by netconvert (may include implicit signs)",
+        ),
+    ]
     remove_geometry: Annotated[
         bool,
         Field(default=True, description="Simplify geometry by removing intermediate nodes"),
@@ -99,6 +106,12 @@ class NetconvertSettings(BaseSettings):
     no_turnarounds: Annotated[
         bool,
         Field(default=True, description="Disable turnaround connections"),
+    ]
+
+    # Signal options
+    country: Annotated[
+        str,
+        Field(default="SE", description="Country code for traffic signal mapping (e.g., SE, DE)"),
     ]
 
     # Logging
