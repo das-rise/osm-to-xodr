@@ -857,3 +857,286 @@ def convert_objects_to_signals(
         signals_converted=total_signals,
         poles_added=total_poles,
     )
+
+
+# ---------------------------------------------------------------------------
+# Dangling junction reference fix
+# ---------------------------------------------------------------------------
+
+_DANGLING_MATCH_TOLERANCE_M = 2.0
+
+
+def _compute_road_endpoint(road: ET.Element, end: str) -> tuple[float, float] | None:
+    """Compute the (x, y) world coordinates of a road's start or end point.
+
+    For *start* this is simply the first geometry's (x, y).
+    For *end* the last geometry's origin is projected forward by the remaining
+    segment length along its heading (exact for lines; a linear approximation
+    for curves, which is accurate enough for proximity matching).
+    """
+    pv = road.find("planView")
+    if pv is None:
+        return None
+    geoms = pv.findall("geometry")
+    if not geoms:
+        return None
+
+    if end == "start":
+        g = geoms[0]
+        return float(g.get("x", "0")), float(g.get("y", "0"))
+
+    # end
+    g = geoms[-1]
+    x = float(g.get("x", "0"))
+    y = float(g.get("y", "0"))
+    hdg = float(g.get("hdg", "0"))
+    road_length = float(road.get("length", "0"))
+    seg_start_s = float(g.get("s", "0"))
+    seg_len = road_length - seg_start_s
+    return x + seg_len * math.cos(hdg), y + seg_len * math.sin(hdg)
+
+
+def _fix_lane_links_for_endpoint(
+    road: ET.Element,
+    road_end: str,
+    connected_road: ET.Element,
+    contact_point: str,
+) -> None:
+    """Add predecessor/successor lane links for a newly connected road pair.
+
+    Args:
+        road: The road whose lane links are being updated.
+        road_end: Which end of *road* is being connected ('start'|'end').
+        connected_road: The road being connected to.
+        contact_point: The contact end on *connected_road* ('start'|'end').
+    """
+    link_tag = "predecessor" if road_end == "start" else "successor"
+
+    # Choose laneSection on the connected road matching the contact point.
+    connected_lane_sections = connected_road.findall(".//laneSection")
+    if not connected_lane_sections:
+        return
+    connected_ls = (
+        connected_lane_sections[-1]
+        if contact_point == "end"
+        else connected_lane_sections[0]
+    )
+    connected_lane_ids = {
+        lane.get("id")
+        for lane in connected_ls.findall(".//lane")
+        if lane.get("id") != "0"
+    }
+
+    # Choose the laneSection at the road end we're patching.
+    our_lane_sections = road.findall(".//laneSection")
+    if not our_lane_sections:
+        return
+    our_ls = (
+        our_lane_sections[0] if road_end == "start" else our_lane_sections[-1]
+    )
+
+    for lane in our_ls.findall(".//lane"):
+        lane_id = lane.get("id", "0")
+        if lane_id == "0":
+            continue
+
+        # Prefer same-signed lane ID; fall back to opposite sign (reverse flow).
+        if lane_id in connected_lane_ids:
+            target_id = lane_id
+        elif str(-int(lane_id)) in connected_lane_ids:
+            target_id = str(-int(lane_id))
+        else:
+            continue
+
+        lane_link = lane.find("link")
+        if lane_link is None:
+            lane_link = ET.SubElement(lane, "link")
+
+        existing = lane_link.find(link_tag)
+        if existing is not None:
+            lane_link.remove(existing)
+
+        new_link = ET.SubElement(lane_link, link_tag)
+        new_link.set("id", target_id)
+
+
+def fix_dangling_junction_refs(xodr_file: Path) -> int:
+    """Fix roads with dangling (non-existent) junction references.
+
+    ``netconvert`` sometimes generates roads whose ``<predecessor>`` or
+    ``<successor>`` link points to a junction ID that has no corresponding
+    ``<junction>`` definition in the output file.  Such roads are
+    topologically isolated: the A* router cannot traverse them, which
+    causes ``NetworkXNoPath`` when their spawn points are chosen.
+
+    This function:
+
+    1. Collects all junction IDs actually defined in the file.
+    2. Identifies roads connected to *phantom* junctions (IDs not defined).
+    3. Computes the geometric endpoint on the dangling side.
+    4. Searches for another road endpoint within
+       ``_DANGLING_MATCH_TOLERANCE_M`` metres.
+    5. Replaces the phantom junction reference with a direct road-to-road
+       link and updates lane ``<link>`` elements accordingly.
+
+    The file is rewritten in place only when at least one fix is applied.
+
+    Args:
+        xodr_file: Path to the OpenDRIVE (.xodr) file.
+
+    Returns:
+        Number of road endpoint connections fixed (0 if nothing needed fixing).
+    """
+    if not xodr_file.exists():
+        logger.warning(f"fix_dangling_junction_refs: file not found: {xodr_file}")
+        return 0
+
+    try:
+        tree = ET.parse(xodr_file)
+        root = tree.getroot()
+    except ET.ParseError as e:
+        logger.error(f"fix_dangling_junction_refs: failed to parse {xodr_file}: {e}")
+        return 0
+
+    # Step 1: Defined junction IDs (as strings, matching XML attribute values).
+    defined_junctions: set[str] = {j.get("id", "") for j in root.findall("junction")}
+
+    # Step 2: Find dangling endpoints — roads referencing non-existent junctions.
+    # Each entry: (road_element, road_end: 'start'|'end', point: (x, y))
+    DanglingEntry = tuple[ET.Element, str, tuple[float, float]]
+    dangling: list[DanglingEntry] = []
+
+    for road in root.findall("road"):
+        # Junction connector roads are managed by junction elements; skip them.
+        if road.get("junction", "-1") != "-1":
+            continue
+        link_elem = road.find("link")
+        if link_elem is None:
+            continue
+        for link_tag, road_end in (("predecessor", "start"), ("successor", "end")):
+            child = link_elem.find(link_tag)
+            if child is None:
+                continue
+            if (
+                child.get("elementType") == "junction"
+                and child.get("elementId", "") not in defined_junctions
+            ):
+                pt = _compute_road_endpoint(road, road_end)
+                if pt is not None:
+                    dangling.append((road, road_end, pt))
+
+    if not dangling:
+        logger.debug("fix_dangling_junction_refs: no dangling junction references found")
+        return 0
+
+    logger.info(
+        f"fix_dangling_junction_refs: found {len(dangling)} dangling "
+        f"junction reference(s) across {len({r.get('id') for r, _, _ in dangling})} "
+        f"road(s) in {xodr_file.name}"
+    )
+
+    # Step 3: Build a lookup of ALL road endpoints for partner search.
+    AllEndpoint = tuple[ET.Element, str, tuple[float, float]]
+    all_endpoints: list[AllEndpoint] = []
+    for road in root.findall("road"):
+        if road.get("junction", "-1") != "-1":
+            continue
+        for road_end in ("start", "end"):
+            pt = _compute_road_endpoint(road, road_end)
+            if pt is not None:
+                all_endpoints.append((road, road_end, pt))
+
+    # Step 4: Match each dangling endpoint to its geometric partner.
+    fixes = 0
+    matched_dangling_indices: set[int] = set()
+
+    for idx, (road_a, end_a, pt_a) in enumerate(dangling):
+        if idx in matched_dangling_indices:
+            continue
+
+        road_a_id = road_a.get("id", "")
+        best_dist = _DANGLING_MATCH_TOLERANCE_M
+        best_road_b: ET.Element | None = None
+        best_end_b: str = ""
+
+        for road_b, end_b, pt_b in all_endpoints:
+            if road_b.get("id") == road_a_id:
+                continue  # Skip self
+            dist = math.hypot(pt_a[0] - pt_b[0], pt_a[1] - pt_b[1])
+            if dist <= best_dist:
+                best_dist = dist
+                best_road_b = road_b
+                best_end_b = end_b
+
+        if best_road_b is None:
+            logger.warning(
+                f"fix_dangling_junction_refs: road {road_a_id} {end_a} endpoint "
+                f"({pt_a[0]:.2f}, {pt_a[1]:.2f}) — no matching partner within "
+                f"{_DANGLING_MATCH_TOLERANCE_M}m; leaving unchanged"
+            )
+            continue
+
+        road_b_id = best_road_b.get("id", "")
+
+        # Step 5: Patch road A's link (replace phantom junction with road ref).
+        link_a = road_a.find("link")
+        if link_a is None:
+            link_a = ET.SubElement(road_a, "link")
+
+        tag_a = "predecessor" if end_a == "start" else "successor"
+        old_a = link_a.find(tag_a)
+        if old_a is not None:
+            link_a.remove(old_a)
+        new_a = ET.SubElement(link_a, tag_a)
+        new_a.set("elementType", "road")
+        new_a.set("elementId", road_b_id)
+        new_a.set("contactPoint", best_end_b)
+
+        # Patch road B's link (add/replace its side of the connection).
+        link_b = best_road_b.find("link")
+        if link_b is None:
+            link_b = ET.SubElement(best_road_b, "link")
+
+        tag_b = "predecessor" if best_end_b == "start" else "successor"
+        old_b = link_b.find(tag_b)
+        if old_b is not None:
+            # Only replace if it is also a phantom junction reference.
+            if (
+                old_b.get("elementType") == "junction"
+                and old_b.get("elementId", "") not in defined_junctions
+            ):
+                link_b.remove(old_b)
+            else:
+                # Road B already has a valid link on this end; don't override.
+                old_b = None  # sentinel: don't write new link on B
+
+        if old_b is None and link_b.find(tag_b) is None:
+            new_b = ET.SubElement(link_b, tag_b)
+            new_b.set("elementType", "road")
+            new_b.set("elementId", road_a_id)
+            new_b.set("contactPoint", end_a)
+
+        # Update lane links for both roads.
+        _fix_lane_links_for_endpoint(road_a, end_a, best_road_b, best_end_b)
+        _fix_lane_links_for_endpoint(best_road_b, best_end_b, road_a, end_a)
+
+        # Mark paired dangling entry (if road_b also appeared in dangling list).
+        for jdx, (rb, eb, _) in enumerate(dangling):
+            if rb.get("id") == road_b_id and eb == best_end_b:
+                matched_dangling_indices.add(jdx)
+        matched_dangling_indices.add(idx)
+
+        fixes += 1
+        logger.info(
+            f"fix_dangling_junction_refs: connected road {road_a_id} ({end_a}) "
+            f"↔ road {road_b_id} ({best_end_b}), dist={best_dist:.3f}m"
+        )
+
+    if fixes > 0:
+        try:
+            tree.write(xodr_file, encoding="UTF-8", xml_declaration=True)
+        except Exception as e:
+            logger.error(f"fix_dangling_junction_refs: failed to write {xodr_file}: {e}")
+            return 0
+
+    return fixes

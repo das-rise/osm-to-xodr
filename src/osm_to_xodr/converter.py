@@ -19,6 +19,7 @@ from osm_to_xodr.netconvert import (
 from osm_to_xodr.osm_extractor import OSMSignalExtractor, merge_poi_files
 from osm_to_xodr.postprocess import (
     convert_objects_to_signals,
+    fix_dangling_junction_refs,
     fix_georeference_for_carla,
 )
 
@@ -227,6 +228,12 @@ def convert_osm_to_xodr(
         logger.info("Step 4: Fixing geoReference for CARLA...")
         # Now uses internal offset calculation via utm library
         fix_georeference_for_carla(output_file)
+
+        # Step 5: Fix roads with dangling (phantom) junction references
+        logger.info("Step 5: Fixing dangling junction references...")
+        fixes = fix_dangling_junction_refs(output_file)
+        if fixes:
+            logger.info(f"  Fixed {fixes} dangling junction connection(s)")
 
         logger.info(f"Conversion complete: {output_file}")
 
