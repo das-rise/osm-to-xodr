@@ -224,19 +224,17 @@ def _get_mapping_key_from_poi(poi: ET.Element) -> str | None:
 def _get_sign_heading_offset_deg(params: dict[str, str]) -> float:
     """Return a sign heading offset, in degrees, from OSM params.
 
-    Supports:
-    - direction (standard OSM tag)
-    - traffic_sign:direction (standard OSM tag)
-    - forward/backward values for direction
+    For forward/backward directions the heading flip is handled entirely
+    by the OpenDRIVE ``orientation`` attribute (see
+    ``_get_signal_orientation``), so this function returns 0 for both.
+    Numeric direction values are passed through as-is.
     """
     # Check for standard OSM direction tags
     direction = params.get("osm.direction") or params.get("osm.traffic_sign:direction")
     if direction is not None:
         direction = str(direction).strip().lower()
 
-        # Handle relative direction (standard in OSM for signs on ways).
-        # Note: forward/backward are encoded in the signal's orientation attribute
-        # (+/-), so no additional hOffset is needed here.
+        # forward/backward are handled via orientation, not hOffset.
         if direction in ("forward", "backward"):
             return 0.0
 
@@ -247,6 +245,35 @@ def _get_sign_heading_offset_deg(params: dict[str, str]) -> float:
             pass
 
     return 0.0
+
+
+def _get_signal_orientation(params: dict[str, str], t_value: float) -> str:
+    """Determine the OpenDRIVE signal orientation ("+" or "-").
+
+    When an explicit OSM ``direction`` tag is present the orientation is
+    derived from it directly (the parent-way filtering in the caller
+    ensures the sign is placed on a road whose s-direction matches the
+    OSM way direction):
+
+    * ``forward``  → ``"+"`` (signal applies to s-direction traffic)
+    * ``backward`` → ``"-"`` (signal applies to traffic against s)
+
+    When no direction tag exists, falls back to the conventional
+    t-coordinate heuristic (``t < 0`` → ``"+"``).
+    """
+    direction = (
+        (params.get("osm.direction") or params.get("osm.traffic_sign:direction") or "")
+        .strip()
+        .lower()
+    )
+
+    if direction == "forward":
+        return "+"
+    if direction == "backward":
+        return "-"
+
+    # No explicit direction: fall back to geometric t-coordinate convention.
+    return "+" if t_value < 0 else "-"
 
 
 def _load_poi_params_by_id(poi_file: Path | None) -> dict[str, dict[str, str]]:
@@ -574,10 +601,14 @@ def _add_missing_poi_signals(
         signal.set("country", country.upper())
         signal.set("width", width)
         signal.set("height", height)
-        signal.set("hOffset", f"{math.radians(_get_sign_heading_offset_deg(params)):.8f}")
+        orientation = _get_signal_orientation(params, best_t)
+        h_offset_deg = _get_sign_heading_offset_deg(params)
+        if orientation == "-":
+            h_offset_deg += 180.0
+        signal.set("hOffset", f"{math.radians(h_offset_deg):.8f}")
         signal.set("pitch", "0.0")
         signal.set("roll", "0.0")
-        signal.set("orientation", "+" if best_t < 0 else "-")
+        signal.set("orientation", orientation)
 
         pole = ET.SubElement(objects_elem, "object")
         pole.set("id", poi_id + ".pole")
@@ -690,20 +721,19 @@ def _process_signals(
             signal.set("width", w)
             signal.set("height", h)
 
-            signal.set("hOffset", f"{math.radians(_get_sign_heading_offset_deg(params)):.8f}")
+            # Set orientation from OSM direction tag, falling back to t-coordinate
+            try:
+                t_val = float(obj.get("t", "0"))
+            except (ValueError, TypeError):
+                t_val = 0.0
+            orientation = _get_signal_orientation(params, t_val)
+            h_offset_deg = _get_sign_heading_offset_deg(params)
+            if orientation == "-":
+                h_offset_deg += 180.0
+            signal.set("hOffset", f"{math.radians(h_offset_deg):.8f}")
             signal.set("pitch", "0.0")
             signal.set("roll", "0.0")
-
-            # Set orientation based on t-coordinate
-            try:
-                t_str = obj.get("t")
-                if t_str:
-                    t_val = float(t_str)
-                    signal.set("orientation", "+" if t_val < 0 else "-")
-                else:
-                    signal.set("orientation", "none")
-            except (ValueError, TypeError):
-                signal.set("orientation", "none")
+            signal.set("orientation", orientation)
 
             # Create Pole
             _add_pole(objects_elem, obj)
