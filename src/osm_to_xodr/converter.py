@@ -19,8 +19,10 @@ from osm_to_xodr.netconvert import (
 from osm_to_xodr.osm_extractor import OSMSignalExtractor, merge_poi_files
 from osm_to_xodr.postprocess import (
     convert_objects_to_signals,
+    detect_split_junction_prune_rules,
     fix_dangling_junction_refs,
     fix_georeference_for_carla,
+    prune_generated_junction_connections,
 )
 
 
@@ -234,6 +236,22 @@ def convert_osm_to_xodr(
         fixes = fix_dangling_junction_refs(output_file)
         if fixes:
             logger.info(f"  Fixed {fixes} dangling junction connection(s)")
+
+        # Step 6: Remove explicitly pruned generated junction connectors
+        auto_rules = []
+        if netconvert_settings.auto_prune_split_junctions:
+            logger.info("Step 6: Detecting split/merge junction pruning candidates...")
+            auto_rules = detect_split_junction_prune_rules(input_file)
+
+        if auto_rules or netconvert_settings.prune_connection_rules:
+            logger.info("Step 6: Pruning generated junction connections...")
+            removed = prune_generated_junction_connections(
+                output_file,
+                netconvert_settings.prune_connection_rules,
+                auto_rules=auto_rules,
+            )
+            if removed:
+                logger.info(f"  Removed {removed} generated junction connection(s)")
 
         logger.info(f"Conversion complete: {output_file}")
 

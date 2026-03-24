@@ -81,6 +81,266 @@ class ConversionResult:
     error: str | None = None
 
 
+@dataclass(frozen=True)
+class JunctionConnectionPruneRule:
+    """Rule describing a generated junction connection to remove."""
+
+    junction_name: str
+    incoming_sumo_id: str
+    outgoing_sumo_id: str
+
+
+def _normalize_sumo_way_id(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if raw.startswith("-"):
+        raw = raw[1:]
+    return raw.split("#", 1)[0]
+
+
+def _sumo_id_matches_rule_value(rule_value: str, actual_value: str) -> bool:
+    rule_value = str(rule_value or "").strip()
+    actual_value = str(actual_value or "").strip()
+    if not rule_value or not actual_value:
+        return False
+    if rule_value.startswith("-") or "#" in rule_value:
+        return rule_value == actual_value
+    return _normalize_sumo_way_id(rule_value) == _normalize_sumo_way_id(actual_value)
+
+
+def _parse_osm_oneway(tags: dict[str, str]) -> int:
+    value = str(tags.get("oneway", "")).strip().lower()
+    if value in {"yes", "true", "1"}:
+        return 1
+    if value in {"-1", "reverse"}:
+        return -1
+    return 0
+
+
+def detect_split_junction_prune_rules(osm_file: Path) -> list[JunctionConnectionPruneRule]:
+    """Detect split/merge nodes that should not connect incoming and outgoing one-way arms.
+
+    Heuristic:
+    - exactly one incoming one-way endpoint
+    - exactly one outgoing one-way endpoint
+    - exactly one bidirectional endpoint
+    - all three belong to distinct OSM ways
+
+    In these cases, ``netconvert`` may create a short internal connector from the
+    incoming one-way arm directly into the outgoing one-way arm. For carriageway
+    split/merge layouts near roundabouts this is typically the spurious patch.
+    """
+    if not osm_file.exists():
+        logger.warning(f"detect_split_junction_prune_rules: file not found: {osm_file}")
+        return []
+
+    try:
+        tree = ET.parse(osm_file)
+        root = tree.getroot()
+    except ET.ParseError as e:
+        logger.error(f"detect_split_junction_prune_rules: failed to parse {osm_file}: {e}")
+        return []
+
+    incidents: dict[str, dict[str, set[str]]] = {}
+
+    for way in root.findall("way"):
+        way_id = way.get("id", "").strip()
+        if not way_id:
+            continue
+        node_refs = [nd.get("ref", "").strip() for nd in way.findall("nd") if nd.get("ref")]
+        if len(node_refs) < 2:
+            continue
+        tags = {
+            tag.get("k", "").strip(): tag.get("v", "").strip()
+            for tag in way.findall("tag")
+            if tag.get("k")
+        }
+        if not str(tags.get("highway", "")).strip():
+            continue
+
+        start_node = node_refs[0]
+        end_node = node_refs[-1]
+        oneway_mode = _parse_osm_oneway(tags)
+
+        if oneway_mode == 1:
+            incidents.setdefault(start_node, {}).setdefault("outgoing_oneway", set()).add(way_id)
+            incidents.setdefault(end_node, {}).setdefault("incoming_oneway", set()).add(way_id)
+        elif oneway_mode == -1:
+            incidents.setdefault(start_node, {}).setdefault("incoming_oneway", set()).add(way_id)
+            incidents.setdefault(end_node, {}).setdefault("outgoing_oneway", set()).add(way_id)
+        else:
+            incidents.setdefault(start_node, {}).setdefault("bidirectional", set()).add(way_id)
+            incidents.setdefault(end_node, {}).setdefault("bidirectional", set()).add(way_id)
+
+    rules: list[JunctionConnectionPruneRule] = []
+    for node_id, groups in incidents.items():
+        incoming_oneway = groups.get("incoming_oneway", set())
+        outgoing_oneway = groups.get("outgoing_oneway", set())
+        bidirectional = groups.get("bidirectional", set())
+        all_way_ids = incoming_oneway | outgoing_oneway | bidirectional
+        if (
+            len(incoming_oneway) == 1
+            and len(outgoing_oneway) == 1
+            and len(bidirectional) == 1
+            and len(all_way_ids) == 3
+        ):
+            rules.append(
+                JunctionConnectionPruneRule(
+                    junction_name=str(node_id),
+                    incoming_sumo_id=next(iter(incoming_oneway)),
+                    outgoing_sumo_id=next(iter(outgoing_oneway)),
+                )
+            )
+
+    logger.info(
+        f"detect_split_junction_prune_rules: detected {len(rules)} split/merge prune rule(s) "
+        f"in {osm_file.name}"
+    )
+    return rules
+
+
+def parse_prune_connection_rules(rule_text: str | None) -> list[JunctionConnectionPruneRule]:
+    """Parse a semicolon-separated list of junction-connection prune rules."""
+    parsed: list[JunctionConnectionPruneRule] = []
+    raw = str(rule_text or "").strip()
+    if not raw:
+        return parsed
+
+    for chunk in raw.replace("\n", ";").split(";"):
+        entry = chunk.strip()
+        if not entry:
+            continue
+        parts = [part.strip() for part in entry.split("|")]
+        if len(parts) != 3 or not all(parts):
+            logger.warning(
+                f"Ignoring invalid prune_connection_rules entry '{entry}'. "
+                "Expected format: junction_name|incoming_sumo_id|outgoing_sumo_id"
+            )
+            continue
+        parsed.append(
+            JunctionConnectionPruneRule(
+                junction_name=parts[0],
+                incoming_sumo_id=parts[1],
+                outgoing_sumo_id=parts[2],
+            )
+        )
+    return parsed
+
+
+def prune_generated_junction_connections(
+    xodr_file: Path,
+    rule_text: str | None,
+    *,
+    auto_rules: list[JunctionConnectionPruneRule] | None = None,
+) -> int:
+    """Remove specific generated internal junction connections from an XODR file.
+
+    Each rule targets one connection by matching:
+    - junction ``name`` attribute
+    - incoming road ``userData code='sumoId'`` value
+    - outgoing road ``userData code='sumoId'`` value
+
+    The matching ``<connection>`` element is removed from the junction and its
+    generated connecting road is removed from the top-level ``<road>`` list.
+    """
+    rules = list(auto_rules or []) + parse_prune_connection_rules(rule_text)
+    if not rules:
+        return 0
+    if not xodr_file.exists():
+        logger.warning(f"prune_generated_junction_connections: file not found: {xodr_file}")
+        return 0
+
+    try:
+        tree = ET.parse(xodr_file)
+        root = tree.getroot()
+    except ET.ParseError as e:
+        logger.error(f"prune_generated_junction_connections: failed to parse {xodr_file}: {e}")
+        return 0
+
+    roads_by_id: dict[str, ET.Element] = {}
+    sumo_id_by_road_id: dict[str, str] = {}
+    for road in root.findall("road"):
+        road_id = road.get("id", "")
+        if not road_id:
+            continue
+        roads_by_id[road_id] = road
+        user_data = road.find("./userData[@code='sumoId']")
+        sumo_id_by_road_id[road_id] = (
+            user_data.get("value", "").strip() if user_data is not None else ""
+        )
+
+    removed_connection_count = 0
+    removed_connecting_road_ids: set[str] = set()
+
+    for junction in root.findall("junction"):
+        junction_name = junction.get("name", "")
+        matching_rules = [rule for rule in rules if rule.junction_name == junction_name]
+        if not matching_rules:
+            continue
+
+        to_remove: list[ET.Element] = []
+        for connection in junction.findall("connection"):
+            incoming_road_id = connection.get("incomingRoad", "")
+            connecting_road_id = connection.get("connectingRoad", "")
+            incoming_sumo_id = sumo_id_by_road_id.get(incoming_road_id, "")
+
+            connecting_road = roads_by_id.get(connecting_road_id)
+            outgoing_sumo_id = ""
+            if connecting_road is not None:
+                successor = connecting_road.find("./link/successor")
+                if successor is not None and successor.get("elementType") == "road":
+                    outgoing_road_id = successor.get("elementId", "")
+                    outgoing_sumo_id = sumo_id_by_road_id.get(outgoing_road_id, "")
+
+            matched_rule = next(
+                (
+                    rule
+                    for rule in matching_rules
+                    if _sumo_id_matches_rule_value(rule.incoming_sumo_id, incoming_sumo_id)
+                    and _sumo_id_matches_rule_value(rule.outgoing_sumo_id, outgoing_sumo_id)
+                ),
+                None,
+            )
+            if matched_rule is None:
+                continue
+
+            logger.info(
+                "prune_generated_junction_connections: removing connection "
+                f"junction={junction_name} incoming={incoming_sumo_id} outgoing={outgoing_sumo_id} "
+                f"(connectingRoad={connecting_road_id})"
+            )
+            to_remove.append(connection)
+            if connecting_road_id:
+                removed_connecting_road_ids.add(connecting_road_id)
+
+        for connection in to_remove:
+            junction.remove(connection)
+            removed_connection_count += 1
+
+        for idx, connection in enumerate(junction.findall("connection")):
+            connection.set("id", str(idx))
+
+    if not removed_connection_count:
+        logger.debug(
+            "prune_generated_junction_connections: no matching generated connections found"
+        )
+        return 0
+
+    for road_id in removed_connecting_road_ids:
+        road = roads_by_id.get(road_id)
+        if road is not None:
+            root.remove(road)
+
+    try:
+        tree.write(xodr_file, encoding="UTF-8", xml_declaration=True)
+    except Exception as e:
+        logger.error(f"prune_generated_junction_connections: failed to write {xodr_file}: {e}")
+        return 0
+
+    return removed_connection_count
+
+
 def fix_georeference_for_carla(xodr_file: Path) -> bool:
     """Fix geoReference to include explicit lat_0/lon_0 for CARLA compatibility.
 
@@ -917,23 +1177,17 @@ def _fix_lane_links_for_endpoint(
     if not connected_lane_sections:
         return
     connected_ls = (
-        connected_lane_sections[-1]
-        if contact_point == "end"
-        else connected_lane_sections[0]
+        connected_lane_sections[-1] if contact_point == "end" else connected_lane_sections[0]
     )
     connected_lane_ids = {
-        lane.get("id")
-        for lane in connected_ls.findall(".//lane")
-        if lane.get("id") != "0"
+        lane.get("id") for lane in connected_ls.findall(".//lane") if lane.get("id") != "0"
     }
 
     # Choose the laneSection at the road end we're patching.
     our_lane_sections = road.findall(".//laneSection")
     if not our_lane_sections:
         return
-    our_ls = (
-        our_lane_sections[0] if road_end == "start" else our_lane_sections[-1]
-    )
+    our_ls = our_lane_sections[0] if road_end == "start" else our_lane_sections[-1]
 
     for lane in our_ls.findall(".//lane"):
         lane_id = lane.get("id", "0")

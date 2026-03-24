@@ -114,6 +114,28 @@ class NetconvertSettings(BaseSettings):
         Field(default="SE", description="Country code for traffic signal mapping (e.g., SE, DE)"),
     ]
 
+    # Postprocess options
+    prune_connection_rules: Annotated[
+        str,
+        Field(
+            default="",
+            description=(
+                "Semicolon-separated rules for removing generated junction connections. "
+                "Format: junction_name|incoming_sumo_id|outgoing_sumo_id"
+            ),
+        ),
+    ]
+    auto_prune_split_junctions: Annotated[
+        bool,
+        Field(
+            default=True,
+            description=(
+                "Automatically remove generated connectors at nodes where one bidirectional road "
+                "meets one incoming and one outgoing one-way road"
+            ),
+        ),
+    ]
+
     # Logging
     aggregate_warnings: Annotated[
         int,
@@ -203,6 +225,12 @@ def generate_env_template() -> str:
         "",
         "# === Logging ===",
         "# OSM_TO_XODR_AGGREGATE_WARNINGS=5",
+        "",
+        "# === Postprocess Rules ===",
+        "# OSM_TO_XODR_AUTO_PRUNE_SPLIT_JUNCTIONS=true",
+        "# Remove a generated connection by junction name and road userData sumoId values",
+        "# Format: junction_name|incoming_sumo_id|outgoing_sumo_id ; separate multiple rules with ';'",
+        "# OSM_TO_XODR_PRUNE_CONNECTION_RULES=-60|-147779315#0|147779306",
         "",
         "# === Application Settings ===",
         "# OSM_TO_XODR_OUTPUT_DIR=output",

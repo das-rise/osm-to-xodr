@@ -151,6 +151,13 @@ def convert(
         bool,
         typer.Option("--turnarounds", help="Enable turnaround connections."),
     ] = False,
+    no_auto_prune_split_junctions: Annotated[
+        bool,
+        typer.Option(
+            "--no-auto-prune-split-junctions",
+            help="Disable automatic pruning of generated split/merge junction connectors.",
+        ),
+    ] = False,
     # App options
     keep_intermediate: Annotated[
         bool,
@@ -206,6 +213,7 @@ def convert(
         remove_geometry=not keep_geometry,
         no_turnarounds=not turnarounds,
         country=country,
+        auto_prune_split_junctions=not no_auto_prune_split_junctions,
     )
 
     app_settings = AppSettings(
