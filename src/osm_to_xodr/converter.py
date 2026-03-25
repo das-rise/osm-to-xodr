@@ -18,7 +18,9 @@ from osm_to_xodr.netconvert import (
 )
 from osm_to_xodr.osm_extractor import OSMSignalExtractor, merge_poi_files
 from osm_to_xodr.postprocess import (
+    clear_generated_junction_connector_lane_marks,
     convert_objects_to_signals,
+    detect_divided_road_path_prune_rules,
     detect_split_junction_prune_rules,
     fix_dangling_junction_refs,
     fix_georeference_for_carla,
@@ -242,6 +244,8 @@ def convert_osm_to_xodr(
         if netconvert_settings.auto_prune_split_junctions:
             logger.info("Step 6: Detecting split/merge junction pruning candidates...")
             auto_rules = detect_split_junction_prune_rules(input_file)
+            auto_rules.extend(detect_divided_road_path_prune_rules(output_file))
+            auto_rules = list(dict.fromkeys(auto_rules))
 
         if auto_rules or netconvert_settings.prune_connection_rules:
             logger.info("Step 6: Pruning generated junction connections...")
@@ -252,6 +256,12 @@ def convert_osm_to_xodr(
             )
             if removed:
                 logger.info(f"  Removed {removed} generated junction connection(s)")
+
+        # Step 7: Remove internal lane marks from generated junction connector roads
+        logger.info("Step 7: Clearing generated junction connector lane marks...")
+        cleared = clear_generated_junction_connector_lane_marks(output_file)
+        if cleared:
+            logger.info(f"  Cleared lane marks on {cleared} generated junction connector road(s)")
 
         logger.info(f"Conversion complete: {output_file}")
 

@@ -90,6 +90,16 @@ class JunctionConnectionPruneRule:
     outgoing_sumo_id: str
 
 
+@dataclass(frozen=True)
+class _RoadPruneInfo:
+    """Subset of road metadata needed for junction-prune heuristics."""
+
+    sumo_id: str
+    base_sumo_id: str
+    name: str
+    lane_category: str
+
+
 def _normalize_sumo_way_id(value: str) -> str:
     raw = str(value or "").strip()
     if not raw:
@@ -198,6 +208,209 @@ def detect_split_junction_prune_rules(osm_file: Path) -> list[JunctionConnection
         f"in {osm_file.name}"
     )
     return rules
+
+
+def clear_generated_junction_connector_lane_marks(xodr_file: Path) -> int:
+    """Remove lane marks from generated internal junction connector roads.
+
+    CARLA's road mesh generation does not render lane markings on short internal
+    junction-patch roads. Clearing them in the generated XODR aligns the viewer
+    more closely with the resulting CARLA mesh and avoids false lateral marks on
+    split/merge/roundabout connector patches.
+    """
+    if not xodr_file.exists():
+        logger.warning(
+            f"clear_generated_junction_connector_lane_marks: file not found: {xodr_file}"
+        )
+        return 0
+
+    try:
+        tree = ET.parse(xodr_file)
+        root = tree.getroot()
+    except ET.ParseError as e:
+        logger.error(
+            f"clear_generated_junction_connector_lane_marks: failed to parse {xodr_file}: {e}"
+        )
+        return 0
+
+    modified_road_ids: set[str] = set()
+    for road in root.findall("road"):
+        road_id = str(road.get("id", "")).strip()
+        if not road_id:
+            continue
+        if str(road.get("junction", "")).strip() == "-1":
+            continue
+        if not str(road.get("name", "")).strip().startswith(":"):
+            continue
+
+        road_modified = False
+        for road_mark in road.findall("./lanes/laneSection/*/lane/roadMark"):
+            if road_mark.get("type") != "none":
+                road_mark.set("type", "none")
+                road_modified = True
+        if road_modified:
+            modified_road_ids.add(road_id)
+
+    if not modified_road_ids:
+        logger.debug(
+            "clear_generated_junction_connector_lane_marks: no matching connector roads found"
+        )
+        return 0
+
+    try:
+        tree.write(xodr_file, encoding="UTF-8", xml_declaration=True)
+    except Exception as e:
+        logger.error(
+            f"clear_generated_junction_connector_lane_marks: failed to write {xodr_file}: {e}"
+        )
+        return 0
+
+    logger.info(
+        "clear_generated_junction_connector_lane_marks: cleared lane marks on "
+        f"{len(modified_road_ids)} generated junction connector road(s) in {xodr_file.name}"
+    )
+    return len(modified_road_ids)
+
+
+def _categorize_road_lanes(road: ET.Element) -> str:
+    lane_types = {
+        str(lane.get("type", "")).strip()
+        for lane in road.findall("./lanes/laneSection/*/lane")
+        if str(lane.get("id", "")).strip() != "0"
+    }
+    lane_types.discard("")
+    lane_types.discard("none")
+    if not lane_types:
+        return ""
+    if "driving" in lane_types:
+        return "driving"
+    if lane_types <= {"restricted"}:
+        return "restricted"
+    return "other"
+
+
+def detect_divided_road_path_prune_rules(xodr_file: Path) -> list[JunctionConnectionPruneRule]:
+    """Detect spurious cross-connectors between split one-way carriageways at path crossings.
+
+    Heuristic:
+    - the junction contains exactly two distinct driving incoming roads with different base OSM ids
+    - the junction also contains at least two restricted incoming roads derived from the same base OSM id
+      (this is the split path/crossing that caused the road segmentation)
+    - both driving base ids have their own same-base continuation through the junction
+    - a connection also exists from one driving base directly to the other driving base while both
+      roads share the same XODR road name
+
+    That cross-connection is the synthetic shortcut/U-patch and is pruned.
+    """
+    if not xodr_file.exists():
+        logger.warning(f"detect_divided_road_path_prune_rules: file not found: {xodr_file}")
+        return []
+
+    try:
+        tree = ET.parse(xodr_file)
+        root = tree.getroot()
+    except ET.ParseError as e:
+        logger.error(f"detect_divided_road_path_prune_rules: failed to parse {xodr_file}: {e}")
+        return []
+
+    road_info_by_id: dict[str, _RoadPruneInfo] = {}
+    for road in root.findall("road"):
+        road_id = str(road.get("id", "")).strip()
+        if not road_id:
+            continue
+        user_data = road.find("./userData[@code='sumoId']")
+        sumo_id = str(user_data.get("value", "")).strip() if user_data is not None else ""
+        road_info_by_id[road_id] = _RoadPruneInfo(
+            sumo_id=sumo_id,
+            base_sumo_id=_normalize_sumo_way_id(sumo_id),
+            name=str(road.get("name", "")).strip(),
+            lane_category=_categorize_road_lanes(road),
+        )
+
+    rules: list[JunctionConnectionPruneRule] = []
+
+    for junction in root.findall("junction"):
+        junction_name = str(junction.get("name", "")).strip()
+        if not junction_name:
+            continue
+
+        connections: list[tuple[str, str, _RoadPruneInfo, _RoadPruneInfo]] = []
+        incoming_infos: dict[str, _RoadPruneInfo] = {}
+
+        for connection in junction.findall("connection"):
+            incoming_road_id = str(connection.get("incomingRoad", "")).strip()
+            connecting_road_id = str(connection.get("connectingRoad", "")).strip()
+            incoming_info = road_info_by_id.get(incoming_road_id)
+            connecting_road = root.find(f"./road[@id='{connecting_road_id}']")
+            if incoming_info is None or connecting_road is None:
+                continue
+            successor = connecting_road.find("./link/successor")
+            if successor is None or successor.get("elementType") != "road":
+                continue
+            outgoing_road_id = str(successor.get("elementId", "")).strip()
+            outgoing_info = road_info_by_id.get(outgoing_road_id)
+            if outgoing_info is None:
+                continue
+
+            incoming_infos[incoming_road_id] = incoming_info
+            connections.append((incoming_road_id, outgoing_road_id, incoming_info, outgoing_info))
+
+        if not connections:
+            continue
+
+        driving_incoming_bases = {
+            info.base_sumo_id
+            for info in incoming_infos.values()
+            if info.lane_category == "driving" and info.base_sumo_id
+        }
+        if len(driving_incoming_bases) != 2:
+            continue
+
+        restricted_base_counts: dict[str, int] = {}
+        for info in incoming_infos.values():
+            if info.lane_category != "restricted" or not info.base_sumo_id:
+                continue
+            restricted_base_counts[info.base_sumo_id] = (
+                restricted_base_counts.get(info.base_sumo_id, 0) + 1
+            )
+        if not any(count >= 2 for count in restricted_base_counts.values()):
+            continue
+
+        continuation_bases = {
+            incoming_info.base_sumo_id
+            for _, _, incoming_info, outgoing_info in connections
+            if incoming_info.lane_category == "driving"
+            and outgoing_info.lane_category == "driving"
+            and incoming_info.base_sumo_id
+            and incoming_info.base_sumo_id == outgoing_info.base_sumo_id
+        }
+        if continuation_bases != driving_incoming_bases:
+            continue
+
+        for _, _, incoming_info, outgoing_info in connections:
+            if incoming_info.lane_category != "driving" or outgoing_info.lane_category != "driving":
+                continue
+            if not incoming_info.base_sumo_id or not outgoing_info.base_sumo_id:
+                continue
+            if incoming_info.base_sumo_id == outgoing_info.base_sumo_id:
+                continue
+            if not incoming_info.name or incoming_info.name != outgoing_info.name:
+                continue
+
+            rules.append(
+                JunctionConnectionPruneRule(
+                    junction_name=junction_name,
+                    incoming_sumo_id=incoming_info.base_sumo_id,
+                    outgoing_sumo_id=outgoing_info.base_sumo_id,
+                )
+            )
+
+    unique_rules = list(dict.fromkeys(rules))
+    logger.info(
+        f"detect_divided_road_path_prune_rules: detected {len(unique_rules)} path-split prune rule(s) "
+        f"in {xodr_file.name}"
+    )
+    return unique_rules
 
 
 def parse_prune_connection_rules(rule_text: str | None) -> list[JunctionConnectionPruneRule]:

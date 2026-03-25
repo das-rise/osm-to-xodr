@@ -10,7 +10,9 @@ import utm
 
 from osm_to_xodr.postprocess import (
     COUNTRY_MAPPINGS,
+    clear_generated_junction_connector_lane_marks,
     convert_objects_to_signals,
+    detect_divided_road_path_prune_rules,
     fix_dangling_junction_refs,
     fix_georeference_for_carla,
 )
@@ -202,6 +204,135 @@ def test_fix_georeference_no_georeference() -> None:
         temp_path.unlink()
 
 
+def test_detect_divided_road_path_prune_rules_flags_cross_connector() -> None:
+    """Detect the shortcut between split one-way carriageways across a path crossing."""
+    xodr_content = """<?xml version="1.0" encoding="UTF-8"?>
+<OpenDRIVE>
+    <road id="1" name="Valldavagen" junction="-1">
+        <lanes><laneSection s="0"><center><lane id="0" type="none" level="true"><link /></lane></center><right><lane id="-1" type="driving" level="true"><link /></lane></right></laneSection></lanes>
+        <userData code="sumoId" value="147779300#0" />
+    </road>
+    <road id="2" name="Valldavagen" junction="-1">
+        <lanes><laneSection s="0"><center><lane id="0" type="none" level="true"><link /></lane></center><right><lane id="-1" type="driving" level="true"><link /></lane></right></laneSection></lanes>
+        <userData code="sumoId" value="147779300#1" />
+    </road>
+    <road id="3" name="Valldavagen" junction="-1">
+        <lanes><laneSection s="0"><center><lane id="0" type="none" level="true"><link /></lane></center><right><lane id="-1" type="driving" level="true"><link /></lane></right></laneSection></lanes>
+        <userData code="sumoId" value="147779296#0" />
+    </road>
+    <road id="4" name="Valldavagen" junction="-1">
+        <lanes><laneSection s="0"><center><lane id="0" type="none" level="true"><link /></lane></center><right><lane id="-1" type="driving" level="true"><link /></lane></right></laneSection></lanes>
+        <userData code="sumoId" value="147779296#1" />
+    </road>
+    <road id="5" name="" junction="-1">
+        <lanes><laneSection s="0"><center><lane id="0" type="none" level="true"><link /></lane></center><right><lane id="-1" type="restricted" level="true"><link /></lane></right></laneSection></lanes>
+        <userData code="sumoId" value="151242162#0" />
+    </road>
+    <road id="6" name="" junction="-1">
+        <lanes><laneSection s="0"><center><lane id="0" type="none" level="true"><link /></lane></center><right><lane id="-1" type="restricted" level="true"><link /></lane></right></laneSection></lanes>
+        <userData code="sumoId" value="151242162#1" />
+    </road>
+    <road id="10" name=":cluster_-21_-38_0" junction="26"><link><successor elementType="road" elementId="2" contactPoint="start" /></link></road>
+    <road id="11" name=":cluster_-21_-38_1" junction="26"><link><successor elementType="road" elementId="4" contactPoint="start" /></link></road>
+    <road id="12" name=":cluster_-21_-38_2" junction="26"><link><successor elementType="road" elementId="5" contactPoint="start" /></link></road>
+    <road id="13" name=":cluster_-21_-38_3" junction="26"><link><successor elementType="road" elementId="6" contactPoint="start" /></link></road>
+    <road id="14" name=":cluster_-21_-38_4" junction="26"><link><successor elementType="road" elementId="4" contactPoint="start" /></link></road>
+    <junction name="cluster_-21_-38" id="26">
+        <connection id="0" incomingRoad="1" connectingRoad="10" contactPoint="start"><laneLink from="-1" to="-1" /></connection>
+        <connection id="1" incomingRoad="1" connectingRoad="11" contactPoint="start"><laneLink from="-1" to="-1" /></connection>
+        <connection id="2" incomingRoad="1" connectingRoad="12" contactPoint="start"><laneLink from="-1" to="-1" /></connection>
+        <connection id="3" incomingRoad="3" connectingRoad="14" contactPoint="start"><laneLink from="-1" to="-1" /></connection>
+        <connection id="4" incomingRoad="3" connectingRoad="13" contactPoint="start"><laneLink from="-1" to="-1" /></connection>
+        <connection id="5" incomingRoad="5" connectingRoad="12" contactPoint="start"><laneLink from="-1" to="-1" /></connection>
+        <connection id="6" incomingRoad="6" connectingRoad="13" contactPoint="start"><laneLink from="-1" to="-1" /></connection>
+    </junction>
+</OpenDRIVE>"""
+
+    with tempfile.NamedTemporaryFile(suffix=".xodr", delete=False, mode="w") as f:
+        f.write(xodr_content)
+        temp_path = Path(f.name)
+
+    try:
+        rules = detect_divided_road_path_prune_rules(temp_path)
+        assert len(rules) == 1
+        assert rules[0].junction_name == "cluster_-21_-38"
+        assert rules[0].incoming_sumo_id == "147779300"
+        assert rules[0].outgoing_sumo_id == "147779296"
+    finally:
+        temp_path.unlink()
+
+
+def test_clear_generated_junction_connector_lane_marks_rewrites_internal_connector_roads() -> None:
+    """Clear lane marks on generated internal junction connector roads only."""
+    xodr_content = """<?xml version="1.0" encoding="UTF-8"?>
+<OpenDRIVE>
+    <road id="10" name="Approach" junction="-1"><userData code="sumoId" value="2" /></road>
+    <road id="11" name="Roundabout" junction="-1"><userData code="sumoId" value="1" /></road>
+    <road id="12" name=":100_0" junction="7">
+        <link>
+            <predecessor elementType="road" elementId="10" contactPoint="end" />
+            <successor elementType="road" elementId="11" contactPoint="start" />
+        </link>
+        <lanes>
+            <laneSection s="0">
+                <center><lane id="0" type="none"><roadMark sOffset="0" type="solid" /></lane></center>
+                <right><lane id="-1" type="driving"><roadMark sOffset="0" type="solid" /></lane></right>
+            </laneSection>
+        </lanes>
+    </road>
+    <road id="13" name=":not_roundabout_0" junction="8">
+        <link>
+            <predecessor elementType="road" elementId="10" contactPoint="end" />
+            <successor elementType="road" elementId="11" contactPoint="start" />
+        </link>
+        <lanes>
+            <laneSection s="0">
+                <center><lane id="0" type="none"><roadMark sOffset="0" type="solid" /></lane></center>
+                <right><lane id="-1" type="driving"><roadMark sOffset="0" type="solid" /></lane></right>
+            </laneSection>
+        </lanes>
+    </road>
+    <road id="14" name="NormalRoad" junction="7">
+        <lanes>
+            <laneSection s="0">
+                <center><lane id="0" type="none"><roadMark sOffset="0" type="solid" /></lane></center>
+                <right><lane id="-1" type="driving"><roadMark sOffset="0" type="solid" /></lane></right>
+            </laneSection>
+        </lanes>
+    </road>
+</OpenDRIVE>"""
+
+    with tempfile.NamedTemporaryFile(suffix=".xodr", delete=False, mode="w") as xodr_tmp:
+        xodr_tmp.write(xodr_content)
+        xodr_path = Path(xodr_tmp.name)
+
+    try:
+        result = clear_generated_junction_connector_lane_marks(xodr_path)
+
+        assert result == 2
+
+        content = xodr_path.read_text(encoding="utf-8")
+        assert '<road id="12" name=":100_0" junction="7">' in content
+        assert '<road id="13" name=":not_roundabout_0" junction="8">' in content
+        assert '<road id="14" name="NormalRoad" junction="7">' in content
+        road12_fragment = content.split('<road id="12" name=":100_0" junction="7">', 1)[1].split(
+            "</road>", 1
+        )[0]
+        road13_fragment = content.split('<road id="13" name=":not_roundabout_0" junction="8">', 1)[
+            1
+        ].split("</road>", 1)[0]
+        road14_fragment = content.split('<road id="14" name="NormalRoad" junction="7">', 1)[
+            1
+        ].split("</road>", 1)[0]
+        assert road12_fragment.count('type="none"') >= 2
+        assert 'roadMark sOffset="0" type="solid"' not in road12_fragment
+        assert road13_fragment.count('type="none"') >= 2
+        assert 'roadMark sOffset="0" type="solid"' not in road13_fragment
+        assert road14_fragment.count('roadMark sOffset="0" type="solid"') == 2
+    finally:
+        xodr_path.unlink()
+
+
 # ---------------------------------------------------------------------------
 # fix_dangling_junction_refs tests
 # ---------------------------------------------------------------------------
@@ -313,9 +444,7 @@ def test_fix_dangling_junction_refs_connects_loop_pair() -> None:
         tmp = Path(f.name)
     try:
         result = fix_dangling_junction_refs(tmp)
-        assert (
-            result == 2
-        ), f"Expected 2 fixes (dangling start of each road), got {result}"
+        assert result == 2, f"Expected 2 fixes (dangling start of each road), got {result}"
 
         root = ET.parse(tmp).getroot()
         road1 = root.find("road[@id='1']")
@@ -325,12 +454,12 @@ def test_fix_dangling_junction_refs_connects_loop_pair() -> None:
         # After fix, road 1's predecessor must point to road 2 (no longer a junction ref)
         pred1 = road1.find("link/predecessor")
         assert pred1 is not None, "Road 1 still has no predecessor after fix"
-        assert (
-            pred1.get("elementType") == "road"
-        ), f"Road 1 predecessor elementType is still '{pred1.get('elementType')}'"
-        assert (
-            pred1.get("elementId") == "2"
-        ), f"Road 1 predecessor elementId should be '2', got '{pred1.get('elementId')}'"
+        assert pred1.get("elementType") == "road", (
+            f"Road 1 predecessor elementType is still '{pred1.get('elementType')}'"
+        )
+        assert pred1.get("elementId") == "2", (
+            f"Road 1 predecessor elementId should be '2', got '{pred1.get('elementId')}'"
+        )
 
         # Road 2's predecessor must point to road 1
         pred2 = road2.find("link/predecessor")
@@ -356,12 +485,9 @@ def test_fix_dangling_junction_refs_lane_links_updated() -> None:
             lane = root.find(f"road[@id='{road_id}']//lane[@id='-1']")
             assert lane is not None, f"Road {road_id}: driving lane -1 not found"
             pred = lane.find("link/predecessor")
-            assert (
-                pred is not None
-            ), f"Road {road_id} lane -1: no lane link predecessor after fix"
+            assert pred is not None, f"Road {road_id} lane -1: no lane link predecessor after fix"
             assert pred.get("id") == "-1", (
-                f"Road {road_id} lane -1 predecessor id should be '-1', "
-                f"got '{pred.get('id')}'"
+                f"Road {road_id} lane -1 predecessor id should be '-1', got '{pred.get('id')}'"
             )
     finally:
         tmp.unlink()
