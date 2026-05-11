@@ -272,6 +272,56 @@ def clear_generated_junction_connector_lane_marks(xodr_file: Path) -> int:
     return len(modified_road_ids)
 
 
+def strip_all_road_marks(xodr_file: Path) -> int:
+    """Remove all non-none roadMark entries from every lane in the XODR file.
+
+    This is the first step of the two-phase lane-marking pipeline.  The
+    exterior boundary markings are re-added geometrically by
+    ``OpenDriveRenderer.rewrite_exterior_road_marks`` in the viewer layer,
+    ensuring that only the outermost road-surface boundary gets a visible
+    marking (no markings inside roundabout patches or junction areas).
+
+    Returns the number of roads modified.
+    """
+    if not xodr_file.exists():
+        logger.warning(f"strip_all_road_marks: file not found: {xodr_file}")
+        return 0
+
+    try:
+        tree = ET.parse(xodr_file)
+        root = tree.getroot()
+    except ET.ParseError as e:
+        logger.error(f"strip_all_road_marks: failed to parse {xodr_file}: {e}")
+        return 0
+
+    modified_road_ids: set[str] = set()
+    for road in root.findall("road"):
+        road_id = str(road.get("id", "")).strip()
+        road_modified = False
+        for road_mark in road.findall("./lanes/laneSection/*/lane/roadMark"):
+            if road_mark.get("type") != "none":
+                road_mark.set("type", "none")
+                road_modified = True
+        if road_modified:
+            modified_road_ids.add(road_id)
+
+    if not modified_road_ids:
+        logger.debug("strip_all_road_marks: no roadMark elements needed clearing")
+        return 0
+
+    try:
+        tree.write(xodr_file, encoding="UTF-8", xml_declaration=True)
+    except Exception as e:
+        logger.error(f"strip_all_road_marks: failed to write {xodr_file}: {e}")
+        return 0
+
+    logger.info(
+        f"strip_all_road_marks: cleared roadMark on {len(modified_road_ids)} road(s) "
+        f"in {xodr_file.name}"
+    )
+    return len(modified_road_ids)
+
+
 def _categorize_road_lanes(road: ET.Element) -> str:
     lane_types = {
         str(lane.get("type", "")).strip()

@@ -25,6 +25,7 @@ from osm_to_xodr.postprocess import (
     fix_dangling_junction_refs,
     fix_georeference_for_carla,
     prune_generated_junction_connections,
+    strip_all_road_marks,
 )
 
 
@@ -257,11 +258,14 @@ def convert_osm_to_xodr(
             if removed:
                 logger.info(f"  Removed {removed} generated junction connection(s)")
 
-        # Step 7: Remove internal lane marks from generated junction connector roads
-        logger.info("Step 7: Clearing generated junction connector lane marks...")
-        cleared = clear_generated_junction_connector_lane_marks(output_file)
+        # Step 7: Remove ALL road marks — exterior marks are re-added geometrically
+        # by OpenDriveRenderer.rewrite_exterior_road_marks at the ORE viewer layer.
+        # This two-phase approach prevents spurious markings inside roundabout and
+        # junction patch areas while retaining the correct exterior road boundary.
+        logger.info("Step 7: Stripping all generated road marks (will be recomputed geometrically)...")
+        cleared = strip_all_road_marks(output_file)
         if cleared:
-            logger.info(f"  Cleared lane marks on {cleared} generated junction connector road(s)")
+            logger.info(f"  Cleared road marks on {cleared} road(s)")
 
         logger.info(f"Conversion complete: {output_file}")
 
